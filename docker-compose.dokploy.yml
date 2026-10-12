@@ -1,0 +1,105 @@
+# Dokploy deployment (single file: app + bundled Postgres, no bundled Traefik).
+#
+# Dokploy already runs its own Traefik on ports 80/443, so docker-compose.traefik.yml must NOT be used here.
+# Routing and HTTPS are configured in the Dokploy UI (Domains tab) instead:
+#   - frontend : Host = your domain, Path = /     , Container Port = 3000
+#   - backend  : Host = your domain, Path = /api  , Container Port = 80   (Strip Path OFF -- the app serves /api)
+# Environment variables set in the Dokploy "Environment" tab are written to ./.env, which env_file reads.
+
+services:
+  backend-init-db:
+    build: ./backend
+    image: claude-code-proxy/backend:latest
+    command: uv run python -m app.scripts.migrate
+    env_file: ./.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build: ./backend
+    image: claude-code-proxy/backend:latest
+    command: uv run gunicorn app.main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:80 --log-level info
+    restart: unless-stopped
+    env_file: ./.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      backend-init-db:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  quota-refresher:
+    build: ./backend
+    image: claude-code-proxy/backend:latest
+    command: uv run python -m app.scripts.quota_refresher
+    restart: unless-stopped
+    env_file: ./.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      backend-init-db:
+        condition: service_completed_successfully
+
+  notification-dispatcher:
+    build: ./backend
+    image: claude-code-proxy/backend:latest
+    command: uv run python -m app.scripts.notification_dispatcher
+    restart: unless-stopped
+    env_file: ./.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      backend-init-db:
+        condition: service_completed_successfully
+
+  archive-retention:
+    build: ./backend
+    image: claude-code-proxy/backend:latest
+    command: uv run python -m app.scripts.archive_retention
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK: "yes"
+      BORG_RELOCATED_REPO_ACCESS_IS_OK: "yes"
+    volumes:
+      - type: bind
+        source: ${ARCHIVE_BORG_HOST_DIR:-/srv/claude-code-proxy/borg}
+        target: /borg
+        bind:
+          create_host_path: true
+    depends_on:
+      backend-init-db:
+        condition: service_completed_successfully
+
+  frontend:
+    build: ./frontend
+    image: claude-code-proxy/frontend:latest
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
